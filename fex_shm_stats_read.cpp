@@ -275,7 +275,6 @@ int main(int argc, char** argv) {
       FEXCore::Profiler::ThreadStats* Stat = StatFromOffset(g_stats.shm_base, HeaderOffset);
 
       auto it = &g_stats.sampled_stats[Stat->TID];
-      memcpy(&it->PreviousStats, &it->Stats, sizeof(FEXCore::Profiler::ThreadStats));
       memcpy(&it->Stats, Stat, sizeof(FEXCore::Profiler::ThreadStats));
       it->LastSeen = Now;
 
