@@ -276,6 +276,7 @@ int main(int argc, char** argv) {
 
       auto it = &g_stats.sampled_stats[Stat->TID];
       memcpy(&it->PreviousStats, &it->Stats, sizeof(FEXCore::Profiler::ThreadStats));
+      memcpy(&it->Stats, Stat, sizeof(FEXCore::Profiler::ThreadStats));
       it->LastSeen = Now;
 
       HeaderOffset = Stat->Next;
@@ -386,7 +387,10 @@ int main(int argc, char** argv) {
                JITSeconds / (double)MaxActiveThreads * 100.0);
       mvprintw(LINES - 4 - HistogramHeight, 0, "    Signal Time: %f %s (%.2f percent)\n", SignalTime * Scale, ScaleStr,
                SignalTime / (double)MaxActiveThreads * 100.0);
-      mvprintw(LINES - 3 - HistogramHeight, 0, "     SIGBUS Cnt: %ld\n", SIGBUSCount);
+
+      double SIGBUS_l = SIGBUSCount;
+      double SIGBUS_Per_Second = SIGBUS_l * (SamplePeriodNanoseconds / NanosecondsInSeconds);
+      mvprintw(LINES - 3 - HistogramHeight, 0, "     SIGBUS Cnt: %ld (%lf per second)\n", SIGBUSCount, SIGBUS_Per_Second);
       mvprintw(LINES - 2 - HistogramHeight, 0, "        SMC Cnt: %ld\n", SMCCount);
       mvprintw(LINES - 1 - HistogramHeight, 0, "  Softfloat Cnt: %ld\n", FloatFallbackCount);
     }
