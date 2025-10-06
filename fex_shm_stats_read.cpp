@@ -87,6 +87,7 @@ static const std::array<wchar_t, 10> partial_pips {
 };
 
 struct fex_stats {
+  const char *pid_str {};
   int pid {-1};
   int shm_fd {-1};
   bool first_sample = true;
@@ -118,12 +119,18 @@ struct fex_stats {
 
   std::vector<float> fex_load_histogram;
 
+  std::atomic<uint64_t> ResidentFEXAnon {~0ULL};
+
+  std::atomic<bool> ShuttingDown {};
+
   int pidfd_watch {-1};
+
 
   fex_stats()
     : fex_load_histogram(200, 0.0f) {}
 };
 
+const auto SamplePeriod = std::chrono::seconds(1);
 fex_stats g_stats {};
 
 #ifndef __x86_64__
@@ -183,15 +190,101 @@ static void check_shm_update_necessary() {
   }
 }
 
+static uint64_t ConvertToBytes(std::string_view Size, std::string_view Granule) {
+  uint64_t SizeBytes {};
+  SizeBytes = strtoull(Size.data(), nullptr, 10);
+
+  // Granule should only be in kB.
+  if (Granule == "kB") {
+    SizeBytes *= 1024U;
+  }
+  else {
+    exit_screen("Unknown size modifier: %s\n", std::string(Granule).c_str());
+  }
+
+  return SizeBytes;
+}
+
+static std::string ConvertMemToHuman(uint64_t MemBytes, const char **Granule) {
+  if (MemBytes >= (1024 * 1024)) {
+    MemBytes /= 1024 * 1024;
+    *Granule = "mB";
+  } else if (MemBytes >= 1024) {
+    MemBytes /= 1024;
+    *Granule = "kB";
+  }
+  return std::format("{}", MemBytes);
+}
+
+static void ResidentFEXAnonSampling() {
+  const auto fex_pid_smaps = std::format("/proc/{}/smaps", g_stats.pid);
+
+  const int smap_fd = open(fex_pid_smaps.c_str(), O_RDONLY);
+
+  if (smap_fd == -1) return;
+
+  std::string File{};
+  while (!g_stats.ShuttingDown.load()) {
+
+    // Read the full file again.
+    File.clear();
+    lseek(smap_fd, 0, SEEK_SET);
+    char TempBuffer[4096];
+    size_t ReadSize {};
+    while ((ReadSize = read(smap_fd, TempBuffer, 4096)) > 0) {
+      File.append(TempBuffer, ReadSize);
+    }
+
+    // Parse the file by line.
+    bool InFEXAnonRegion = false;
+    uint64_t TotalResident {};
+
+    std::istringstream ss(File);
+    std::string Line;
+    while (std::getline(ss, Line)) {
+      if (Line.find("FEXMem") != Line.npos) {
+        InFEXAnonRegion = true;
+        continue;
+      }
+
+      if (Line.find("VmFlags") != Line.npos) {
+        InFEXAnonRegion = false;
+        continue;
+      }
+
+      if (InFEXAnonRegion && Line.find("Rss") != Line.npos) {
+        // Parse the residency for this mapped region and add it.
+        // ex: `Rss:                 560 kB`
+        auto GranuleIter = Line.find_last_of(' ') + 1;
+        auto SizeIter = Line.find_last_of(' ', GranuleIter - 2) + 1;
+
+        std::string_view GranuleView = std::string_view(&Line.at(GranuleIter));
+        std::string_view SizeView = std::string_view(&Line.at(SizeIter), GranuleIter - SizeIter - 1);
+        TotalResident += ConvertToBytes(SizeView, GranuleView);
+        continue;
+      }
+    }
+
+    if (TotalResident) {
+      g_stats.ResidentFEXAnon.store(TotalResident);
+    }
+    std::this_thread::sleep_for(SamplePeriod);
+  }
+
+  close(smap_fd);
+}
+
 int main(int argc, char** argv) {
   if (argc < 2) {
     printf("usage: %s [options] <pid>\n", argv[0]);
     return 0;
   }
+  g_stats.pid_str = argv[argc - 1];
+  g_stats.pid = strtol(g_stats.pid_str, nullptr, 10);
 
   setup_signal_handler();
 
-  const auto fex_shm = std::format("fex-{}-stats", argv[argc - 1]);
+  const auto fex_shm = std::format("fex-{}-stats", g_stats.pid_str);
   g_stats.shm_fd = shm_open(fex_shm.c_str(), O_RDONLY, 0);
   if (g_stats.shm_fd == -1) {
     printf("%s doesn't seem to exist\n", fex_shm.c_str());
@@ -209,7 +302,7 @@ int main(int argc, char** argv) {
     return 1;
   }
 
-  g_stats.pidfd_watch = ::syscall(SYS_pidfd_open, strtol(argv[argc - 1], nullptr, 10), 0);
+  g_stats.pidfd_watch = ::syscall(SYS_pidfd_open, g_stats.pid, 0);
   setlocale(LC_ALL, "");
   initscr();
   start_color();
@@ -223,7 +316,7 @@ int main(int argc, char** argv) {
   std::string fex_version {g_stats.head->fex_version, strnlen(g_stats.head->fex_version, sizeof(g_stats.head->fex_version))};
 
   store_memory_barrier();
-  printw("Header for PID %s:\n", argv[argc - 1]);
+  printw("Header for PID %d:\n", g_stats.pid);
   printw("  Version: 0x%x\n", g_stats.head->Version);
   printw("  Type: %s\n", GetAppType(g_stats.head->app_type));
   printw("  Fex: %s\n", fex_version.c_str());
@@ -241,7 +334,10 @@ int main(int argc, char** argv) {
   bool FirstLoop = true;
   double Scale = 1000.0;
   const char* ScaleStr = "ms/second";
-  const auto SamplePeriod = std::chrono::seconds(1);
+
+  std::thread ResidentAnonThread {ResidentFEXAnonSampling};
+
+  const char *ExitString {};
 
   while (true) {
     if (g_stats.pidfd_watch != -1) {
@@ -253,7 +349,8 @@ int main(int argc, char** argv) {
       int Res = poll(&fd, 1, 0);
       if (Res == 1) {
         if (fd.revents & POLLHUP) {
-          exit_screen("FEX process exited\n");
+          ExitString = "FEX process exited\n";
+          goto exit;
         }
       }
     }
@@ -345,7 +442,7 @@ int main(int argc, char** argv) {
 
       const auto MaxActiveThreads = std::min<size_t>(g_stats.sampled_stats.size(), g_stats.hardware_concurrency);
 
-      mvprintw(LINES - 7 - minimum_hot_threads - HistogramHeight, 0, "%ld threads executing\n", minimum_hot_threads);
+      mvprintw(LINES - 9 - minimum_hot_threads - HistogramHeight, 0, "%ld threads executing\n", minimum_hot_threads);
 
       size_t max_pips = std::min(COLS, 50) - 2;
       double percentage_per_pip = 100.0 / (double)max_pips;
@@ -363,7 +460,7 @@ int main(int argc, char** argv) {
         wmemset(thread_loads.pip_data.data(), partial_pips.back(), full_pips);
         wmemset(thread_loads.pip_data.data() + full_pips, partial_pips[digit_percent], 1);
 
-        const auto y_offset = LINES - 7 - i - HistogramHeight;
+        const auto y_offset = LINES - 8 - i - HistogramHeight;
         mvprintw(y_offset, 0, "[%ls]: %.02f%%\n", g_stats.empty_pip_data.data(), thread_load);
         int attr = 0;
         if (thread_load >= 75.0) {
@@ -380,18 +477,18 @@ int main(int argc, char** argv) {
         }
       }
 
-      mvprintw(LINES - 6 - HistogramHeight, 0, "Total (%zd millisecond sample period):\n",
+      mvprintw(LINES - 7 - HistogramHeight, 0, "Total (%zd millisecond sample period):\n",
                std::chrono::duration_cast<std::chrono::milliseconds>(SamplePeriod).count());
-      mvprintw(LINES - 5 - HistogramHeight, 0, "       JIT Time: %f %s (%.2f percent)\n", JITSeconds * Scale, ScaleStr,
+      mvprintw(LINES - 6 - HistogramHeight, 0, "       JIT Time: %f %s (%.2f percent)\n", JITSeconds * Scale, ScaleStr,
                JITSeconds / (double)MaxActiveThreads * 100.0);
-      mvprintw(LINES - 4 - HistogramHeight, 0, "    Signal Time: %f %s (%.2f percent)\n", SignalTime * Scale, ScaleStr,
+      mvprintw(LINES - 5 - HistogramHeight, 0, "    Signal Time: %f %s (%.2f percent)\n", SignalTime * Scale, ScaleStr,
                SignalTime / (double)MaxActiveThreads * 100.0);
 
       double SIGBUS_l = SIGBUSCount;
       double SIGBUS_Per_Second = SIGBUS_l * (SamplePeriodNanoseconds / NanosecondsInSeconds);
-      mvprintw(LINES - 3 - HistogramHeight, 0, "     SIGBUS Cnt: %ld (%lf per second)\n", SIGBUSCount, SIGBUS_Per_Second);
-      mvprintw(LINES - 2 - HistogramHeight, 0, "        SMC Cnt: %ld\n", SMCCount);
-      mvprintw(LINES - 1 - HistogramHeight, 0, "  Softfloat Cnt: %ld\n", FloatFallbackCount);
+      mvprintw(LINES - 4 - HistogramHeight, 0, "     SIGBUS Cnt: %ld (%lf per second)\n", SIGBUSCount, SIGBUS_Per_Second);
+      mvprintw(LINES - 3 - HistogramHeight, 0, "        SMC Cnt: %ld\n", SMCCount);
+      mvprintw(LINES - 2 - HistogramHeight, 0, "  Softfloat Cnt: %ld\n", FloatFallbackCount);
     }
 
     g_stats.fex_load_histogram.erase(g_stats.fex_load_histogram.begin());
@@ -403,7 +500,17 @@ int main(int argc, char** argv) {
       mvprintw(LINES - i - 1, COLS - 1, "]");
     }
 
-    mvprintw(LINES - HistogramHeight, 0, "FEX JIT Load: %f (cycles: %ld)\n", fex_load, total_jit_time);
+    mvprintw(LINES - 1 - HistogramHeight, 0, "FEX JIT Load: %f (cycles: %ld)\n", fex_load, total_jit_time);
+
+    const uint64_t MemBytes = g_stats.ResidentFEXAnon.load();
+    if (MemBytes == ~0ULL) {
+      mvprintw(LINES - HistogramHeight, 0, "Total FEX Anon memory resident: Couldn't detect\n");
+    } else {
+      const char *Granule {};
+      std::string SizeHuman = ConvertMemToHuman(MemBytes, &Granule);
+      mvprintw(LINES - HistogramHeight, 0, "Total FEX Anon memory resident: %s %s\n", SizeHuman.c_str(), Granule);
+    }
+
     size_t j = 0;
     for (auto& HistogramResult : std::ranges::reverse_view {g_stats.fex_load_histogram}) {
       for (size_t i = 0; i < HistogramHeight - 1; ++i) {
@@ -447,8 +554,11 @@ int main(int argc, char** argv) {
     std::this_thread::sleep_for(SamplePeriod);
   }
 
+exit:
+  g_stats.ShuttingDown = true;
   close(g_stats.shm_fd);
   close(g_stats.pidfd_watch);
-  exit_screen();
+  ResidentAnonThread.join();
+  exit_screen(ExitString);
   return 0;
 }
