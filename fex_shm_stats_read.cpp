@@ -120,11 +120,11 @@ struct fex_stats {
   std::vector<float> fex_load_histogram;
 
   std::atomic<uint64_t> ResidentFEXAnon {~0ULL};
+  std::atomic<uint64_t> ResidentFEXJITAnon {~0ULL};
 
   std::atomic<bool> ShuttingDown {};
 
   int pidfd_watch {-1};
-
 
   fex_stats()
     : fex_load_histogram(200, 0.0f) {}
@@ -237,18 +237,25 @@ static void ResidentFEXAnonSampling() {
 
     // Parse the file by line.
     bool InFEXAnonRegion = false;
+    bool InFEXJITAnonRegion = false;
     uint64_t TotalResident {};
+    uint64_t TotalJITResident {};
 
     std::istringstream ss(File);
     std::string Line;
     while (std::getline(ss, Line)) {
       if (Line.find("FEXMem") != Line.npos) {
         InFEXAnonRegion = true;
+        if (Line.find("FEXMemJIT") != Line.npos) {
+          InFEXJITAnonRegion = true;
+        }
+
         continue;
       }
 
       if (Line.find("VmFlags") != Line.npos) {
         InFEXAnonRegion = false;
+        InFEXJITAnonRegion = false;
         continue;
       }
 
@@ -260,13 +267,19 @@ static void ResidentFEXAnonSampling() {
 
         std::string_view GranuleView = std::string_view(&Line.at(GranuleIter));
         std::string_view SizeView = std::string_view(&Line.at(SizeIter), GranuleIter - SizeIter - 1);
-        TotalResident += ConvertToBytes(SizeView, GranuleView);
+        uint64_t ResidentInBytes = ConvertToBytes(SizeView, GranuleView);
+        TotalResident += ResidentInBytes;
+
+        if (InFEXJITAnonRegion) {
+          TotalJITResident += ResidentInBytes;
+        }
         continue;
       }
     }
 
     if (TotalResident) {
       g_stats.ResidentFEXAnon.store(TotalResident);
+      g_stats.ResidentFEXJITAnon.store(TotalJITResident);
     }
     std::this_thread::sleep_for(SamplePeriod);
   }
@@ -460,7 +473,7 @@ int main(int argc, char** argv) {
         wmemset(thread_loads.pip_data.data(), partial_pips.back(), full_pips);
         wmemset(thread_loads.pip_data.data() + full_pips, partial_pips[digit_percent], 1);
 
-        const auto y_offset = LINES - 8 - i - HistogramHeight;
+        const auto y_offset = LINES - 9 - i - HistogramHeight;
         mvprintw(y_offset, 0, "[%ls]: %.02f%%\n", g_stats.empty_pip_data.data(), thread_load);
         int attr = 0;
         if (thread_load >= 75.0) {
@@ -477,18 +490,18 @@ int main(int argc, char** argv) {
         }
       }
 
-      mvprintw(LINES - 7 - HistogramHeight, 0, "Total (%zd millisecond sample period):\n",
+      mvprintw(LINES - 8 - HistogramHeight, 0, "Total (%zd millisecond sample period):\n",
                std::chrono::duration_cast<std::chrono::milliseconds>(SamplePeriod).count());
-      mvprintw(LINES - 6 - HistogramHeight, 0, "       JIT Time: %f %s (%.2f percent)\n", JITSeconds * Scale, ScaleStr,
+      mvprintw(LINES - 7 - HistogramHeight, 0, "       JIT Time: %f %s (%.2f percent)\n", JITSeconds * Scale, ScaleStr,
                JITSeconds / (double)MaxActiveThreads * 100.0);
-      mvprintw(LINES - 5 - HistogramHeight, 0, "    Signal Time: %f %s (%.2f percent)\n", SignalTime * Scale, ScaleStr,
+      mvprintw(LINES - 6 - HistogramHeight, 0, "    Signal Time: %f %s (%.2f percent)\n", SignalTime * Scale, ScaleStr,
                SignalTime / (double)MaxActiveThreads * 100.0);
 
       double SIGBUS_l = SIGBUSCount;
       double SIGBUS_Per_Second = SIGBUS_l * (SamplePeriodNanoseconds / NanosecondsInSeconds);
-      mvprintw(LINES - 4 - HistogramHeight, 0, "     SIGBUS Cnt: %ld (%lf per second)\n", SIGBUSCount, SIGBUS_Per_Second);
-      mvprintw(LINES - 3 - HistogramHeight, 0, "        SMC Cnt: %ld\n", SMCCount);
-      mvprintw(LINES - 2 - HistogramHeight, 0, "  Softfloat Cnt: %ld\n", FloatFallbackCount);
+      mvprintw(LINES - 5 - HistogramHeight, 0, "     SIGBUS Cnt: %ld (%lf per second)\n", SIGBUSCount, SIGBUS_Per_Second);
+      mvprintw(LINES - 4 - HistogramHeight, 0, "        SMC Cnt: %ld\n", SMCCount);
+      mvprintw(LINES - 3 - HistogramHeight, 0, "  Softfloat Cnt: %ld\n", FloatFallbackCount);
     }
 
     g_stats.fex_load_histogram.erase(g_stats.fex_load_histogram.begin());
@@ -500,15 +513,23 @@ int main(int argc, char** argv) {
       mvprintw(LINES - i - 1, COLS - 1, "]");
     }
 
-    mvprintw(LINES - 1 - HistogramHeight, 0, "FEX JIT Load: %f (cycles: %ld)\n", fex_load, total_jit_time);
+    mvprintw(LINES - 2 - HistogramHeight, 0, "FEX JIT Load: %f (cycles: %ld)\n", fex_load, total_jit_time);
 
     const uint64_t MemBytes = g_stats.ResidentFEXAnon.load();
+    const uint64_t MemBytesJIT = g_stats.ResidentFEXJITAnon.load();
+
     if (MemBytes == ~0ULL) {
-      mvprintw(LINES - HistogramHeight, 0, "Total FEX Anon memory resident: Couldn't detect\n");
+      mvprintw(LINES - 1 - HistogramHeight, 0, "Total FEX Anon memory resident: Couldn't detect\n");
+      mvprintw(LINES - 0 - HistogramHeight, 0, "Total FEX JIT Anon memory resident: Couldn't detect\n");
+
     } else {
       const char *Granule {};
+      const char *GranuleJIT {};
       std::string SizeHuman = ConvertMemToHuman(MemBytes, &Granule);
-      mvprintw(LINES - HistogramHeight, 0, "Total FEX Anon memory resident: %s %s\n", SizeHuman.c_str(), Granule);
+      std::string SizeHumanJIT = ConvertMemToHuman(MemBytesJIT, &GranuleJIT);
+
+      mvprintw(LINES - 1 - HistogramHeight, 0, "Total FEX Anon memory resident: %s %s\n", SizeHuman.c_str(), Granule);
+      mvprintw(LINES - 0 - HistogramHeight, 0, "Total FEX JIT Anon memory resident: %s %s\n", SizeHumanJIT.c_str(), GranuleJIT);
     }
 
     size_t j = 0;
