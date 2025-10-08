@@ -218,15 +218,16 @@ static uint64_t ConvertToBytes(std::string_view Size, std::string_view Granule) 
   return SizeBytes;
 }
 
-static std::string ConvertMemToHuman(uint64_t MemBytes, const char **Granule) {
+static std::string ConvertMemToHuman(uint64_t MemBytes) {
+  const char *Granule;
   if (MemBytes >= (1024 * 1024)) {
     MemBytes /= 1024 * 1024;
-    *Granule = "mB";
+    Granule = "MiB";
   } else if (MemBytes >= 1024) {
     MemBytes /= 1024;
-    *Granule = "kB";
+    Granule = "KiB";
   }
-  return std::format("{}", MemBytes);
+  return std::format("{} {}", MemBytes, Granule);
 }
 
 static void ResidentFEXAnonSampling() {
@@ -579,34 +580,25 @@ int main(int argc, char** argv) {
       mvprintw(LINES - 8 - HistogramHeight, 0, "Total FEX Anon memory resident: Couldn't detect\n");
 
     } else {
-      const char *Granule {};
-      const char *GranuleJIT {};
-      const char *GranuleOpDispatcher {};
-      const char *GranuleFrontend {};
-      const char *GranuleCPUBackend {};
-      const char *GranuleLookup {};
-      const char *GranuleLookupL1 {};
-      const char *GranuleThreadStates {};
-      const char *GranuleUnaccounted {};
-      std::string SizeHuman = ConvertMemToHuman(MemBytes, &Granule);
-      std::string SizeHumanJIT = ConvertMemToHuman(MemBytesJIT, &GranuleJIT);
-      std::string SizeHumanOpDispatcher = ConvertMemToHuman(MemBytesOpDispatcher, &GranuleOpDispatcher);
-      std::string SizeHumanFrontend = ConvertMemToHuman(MemBytesFrontend, &GranuleFrontend);
-      std::string SizeHumanCPUBackend = ConvertMemToHuman(MemBytesCPUBackend, &GranuleCPUBackend);
-      std::string SizeHumanLookup = ConvertMemToHuman(MemBytesLookup, &GranuleLookup);
-      std::string SizeHumanLookupL1 = ConvertMemToHuman(MemBytesLookupL1, &GranuleLookupL1);
-      std::string SizeHumanThreadStates = ConvertMemToHuman(MemBytesThreadStates, &GranuleThreadStates);
-      std::string SizeHumanUnaccounted = ConvertMemToHuman(MemBytesUnaccounted, &GranuleUnaccounted);
+      std::string SizeHuman = ConvertMemToHuman(MemBytes);
+      std::string SizeHumanJIT = ConvertMemToHuman(MemBytesJIT);
+      std::string SizeHumanOpDispatcher = ConvertMemToHuman(MemBytesOpDispatcher);
+      std::string SizeHumanFrontend = ConvertMemToHuman(MemBytesFrontend);
+      std::string SizeHumanCPUBackend = ConvertMemToHuman(MemBytesCPUBackend);
+      std::string SizeHumanLookup = ConvertMemToHuman(MemBytesLookup);
+      std::string SizeHumanLookupL1 = ConvertMemToHuman(MemBytesLookupL1);
+      std::string SizeHumanThreadStates = ConvertMemToHuman(MemBytesThreadStates);
+      std::string SizeHumanUnaccounted = ConvertMemToHuman(MemBytesUnaccounted);
 
-      mvprintw(LINES - 8 - HistogramHeight, 0, "Total FEX Anon memory resident: %s %s\n", SizeHuman.c_str(), Granule);
-      mvprintw(LINES - 7 - HistogramHeight, 0, "    JIT resident:             %s %s\n", SizeHumanJIT.c_str(), GranuleJIT);
-      mvprintw(LINES - 6 - HistogramHeight, 0, "    OpDispatcher resident:    %s %s\n", SizeHumanOpDispatcher.c_str(), GranuleOpDispatcher);
-      mvprintw(LINES - 5 - HistogramHeight, 0, "    Frontend resident:        %s %s\n", SizeHumanFrontend.c_str(), GranuleFrontend);
-      mvprintw(LINES - 4 - HistogramHeight, 0, "    CPUBackend resident:      %s %s\n", SizeHumanCPUBackend.c_str(), GranuleCPUBackend);
-      mvprintw(LINES - 3 - HistogramHeight, 0, "    Lookup cache resident:    %s %s\n", SizeHumanLookup.c_str(), GranuleLookup);
-      mvprintw(LINES - 2 - HistogramHeight, 0, "    Lookup L1 cache resident: %s %s\n", SizeHumanLookupL1.c_str(), GranuleLookupL1);
-      mvprintw(LINES - 1 - HistogramHeight, 0, "    ThreadStates resident:    %s %s\n", SizeHumanThreadStates.c_str(), GranuleThreadStates);
-      mvprintw(LINES - 0 - HistogramHeight, 0, "    Unaccounted resident:     %s %s\n", SizeHumanUnaccounted.c_str(), GranuleUnaccounted);
+      mvprintw(LINES - 8 - HistogramHeight, 0, "Total FEX Anon memory resident: %s\n", SizeHuman.c_str());
+      mvprintw(LINES - 7 - HistogramHeight, 0, "    JIT resident:             %s\n", SizeHumanJIT.c_str());
+      mvprintw(LINES - 6 - HistogramHeight, 0, "    OpDispatcher resident:    %s\n", SizeHumanOpDispatcher.c_str());
+      mvprintw(LINES - 5 - HistogramHeight, 0, "    Frontend resident:        %s\n", SizeHumanFrontend.c_str());
+      mvprintw(LINES - 4 - HistogramHeight, 0, "    CPUBackend resident:      %s\n", SizeHumanCPUBackend.c_str());
+      mvprintw(LINES - 3 - HistogramHeight, 0, "    Lookup cache resident:    %s\n", SizeHumanLookup.c_str());
+      mvprintw(LINES - 2 - HistogramHeight, 0, "    Lookup L1 cache resident: %s\n", SizeHumanLookupL1.c_str());
+      mvprintw(LINES - 1 - HistogramHeight, 0, "    ThreadStates resident:    %s\n", SizeHumanThreadStates.c_str());
+      mvprintw(LINES - 0 - HistogramHeight, 0, "    Unaccounted resident:     %s\n", SizeHumanUnaccounted.c_str());
     }
 
     size_t j = 0;
