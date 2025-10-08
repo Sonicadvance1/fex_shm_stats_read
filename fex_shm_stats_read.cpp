@@ -243,9 +243,14 @@ static void ResidentFEXAnonSampling() {
     File.clear();
     lseek(smap_fd, 0, SEEK_SET);
     char TempBuffer[4096];
-    size_t ReadSize {};
+    ssize_t ReadSize {};
     while ((ReadSize = read(smap_fd, TempBuffer, 4096)) > 0) {
       File.append(TempBuffer, ReadSize);
+    }
+
+    if (ReadSize == -1) {
+      // Error.
+      goto exit;
     }
 
     // Parse the file by line.
@@ -327,6 +332,7 @@ static void ResidentFEXAnonSampling() {
     std::this_thread::sleep_for(SamplePeriod);
   }
 
+exit:
   close(smap_fd);
 }
 
