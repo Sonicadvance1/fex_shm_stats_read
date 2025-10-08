@@ -119,8 +119,21 @@ struct fex_stats {
 
   std::vector<float> fex_load_histogram;
 
-  std::atomic<uint64_t> ResidentFEXAnon {~0ULL};
-  std::atomic<uint64_t> ResidentFEXJITAnon {~0ULL};
+  struct FEXMemStats final {
+    // Total resident
+    std::atomic<uint64_t> TotalAnon {~0ULL};
+
+    // JIT Code
+    std::atomic<uint64_t> JITCode {~0ULL};
+    std::atomic<uint64_t> OpDispatcher {~0ULL};
+    std::atomic<uint64_t> Frontend {~0ULL};
+    std::atomic<uint64_t> CPUBackend {~0ULL};
+    std::atomic<uint64_t> Lookup {~0ULL};
+    std::atomic<uint64_t> LookupL1 {~0ULL};
+    std::atomic<uint64_t> ThreadStates {~0ULL};
+    std::atomic<uint64_t> Unaccounted {~0ULL};
+  };
+  FEXMemStats MemStats;
 
   std::atomic<bool> ShuttingDown {};
 
@@ -237,9 +250,17 @@ static void ResidentFEXAnonSampling() {
 
     // Parse the file by line.
     bool InFEXAnonRegion = false;
-    bool InFEXJITAnonRegion = false;
     uint64_t TotalResident {};
     uint64_t TotalJITResident {};
+    uint64_t TotalOpDispatcherResident {};
+    uint64_t TotalFrontendResident {};
+    uint64_t TotalCPUBackendResident {};
+    uint64_t TotalLookupResident {};
+    uint64_t TotalLookupL1Resident {};
+    uint64_t TotalThreadStateResident {};
+    uint64_t TotalUnaccounted{};
+
+    uint64_t *ActiveSubRegion {};
 
     std::istringstream ss(File);
     std::string Line;
@@ -247,7 +268,19 @@ static void ResidentFEXAnonSampling() {
       if (Line.find("FEXMem") != Line.npos) {
         InFEXAnonRegion = true;
         if (Line.find("FEXMemJIT") != Line.npos) {
-          InFEXJITAnonRegion = true;
+          ActiveSubRegion = &TotalJITResident;
+        } else if (Line.find("FEXMem_OpDispatcher") != Line.npos) {
+          ActiveSubRegion = &TotalOpDispatcherResident;
+        } else if (Line.find("FEXMem_Frontend") != Line.npos) {
+          ActiveSubRegion = &TotalFrontendResident;
+        } else if (Line.find("FEXMem_CPUBackend") != Line.npos) {
+          ActiveSubRegion = &TotalCPUBackendResident;
+        } else if (Line.find("FEXMem_Lookup_L1") != Line.npos) {
+          ActiveSubRegion = &TotalLookupL1Resident;
+        } else if (Line.find("FEXMem_Lookup") != Line.npos) {
+          ActiveSubRegion = &TotalLookupResident;
+        } else if (Line.find("FEXMem_ThreadState") != Line.npos) {
+          ActiveSubRegion = &TotalThreadStateResident;
         }
 
         continue;
@@ -255,7 +288,7 @@ static void ResidentFEXAnonSampling() {
 
       if (Line.find("VmFlags") != Line.npos) {
         InFEXAnonRegion = false;
-        InFEXJITAnonRegion = false;
+        ActiveSubRegion = nullptr;
         continue;
       }
 
@@ -270,16 +303,26 @@ static void ResidentFEXAnonSampling() {
         uint64_t ResidentInBytes = ConvertToBytes(SizeView, GranuleView);
         TotalResident += ResidentInBytes;
 
-        if (InFEXJITAnonRegion) {
-          TotalJITResident += ResidentInBytes;
+        if (ActiveSubRegion) {
+          *ActiveSubRegion += ResidentInBytes;
+        }
+        else {
+          TotalUnaccounted += ResidentInBytes;
         }
         continue;
       }
     }
 
     if (TotalResident) {
-      g_stats.ResidentFEXAnon.store(TotalResident);
-      g_stats.ResidentFEXJITAnon.store(TotalJITResident);
+      g_stats.MemStats.TotalAnon.store(TotalResident);
+      g_stats.MemStats.JITCode.store(TotalJITResident);
+      g_stats.MemStats.OpDispatcher.store(TotalOpDispatcherResident);
+      g_stats.MemStats.Frontend.store(TotalFrontendResident);
+      g_stats.MemStats.CPUBackend.store(TotalCPUBackendResident);
+      g_stats.MemStats.Lookup.store(TotalLookupResident);
+      g_stats.MemStats.LookupL1.store(TotalLookupL1Resident);
+      g_stats.MemStats.ThreadStates.store(TotalThreadStateResident);
+      g_stats.MemStats.Unaccounted.store(TotalUnaccounted);
     }
     std::this_thread::sleep_for(SamplePeriod);
   }
@@ -455,7 +498,8 @@ int main(int argc, char** argv) {
 
       const auto MaxActiveThreads = std::min<size_t>(g_stats.sampled_stats.size(), g_stats.hardware_concurrency);
 
-      mvprintw(LINES - 9 - minimum_hot_threads - HistogramHeight, 0, "%ld threads executing\n", minimum_hot_threads);
+      constexpr auto TopOfThreads = 16;
+      mvprintw(LINES - TopOfThreads - minimum_hot_threads - HistogramHeight, 0, "%ld threads executing\n", minimum_hot_threads);
 
       size_t max_pips = std::min(COLS, 50) - 2;
       double percentage_per_pip = 100.0 / (double)max_pips;
@@ -473,7 +517,7 @@ int main(int argc, char** argv) {
         wmemset(thread_loads.pip_data.data(), partial_pips.back(), full_pips);
         wmemset(thread_loads.pip_data.data() + full_pips, partial_pips[digit_percent], 1);
 
-        const auto y_offset = LINES - 9 - i - HistogramHeight;
+        const auto y_offset = LINES - TopOfThreads - i - HistogramHeight;
         mvprintw(y_offset, 0, "[%ls]: %.02f%%\n", g_stats.empty_pip_data.data(), thread_load);
         int attr = 0;
         if (thread_load >= 75.0) {
@@ -490,18 +534,18 @@ int main(int argc, char** argv) {
         }
       }
 
-      mvprintw(LINES - 8 - HistogramHeight, 0, "Total (%zd millisecond sample period):\n",
+      mvprintw(LINES - 15 - HistogramHeight, 0, "Total (%zd millisecond sample period):\n",
                std::chrono::duration_cast<std::chrono::milliseconds>(SamplePeriod).count());
-      mvprintw(LINES - 7 - HistogramHeight, 0, "       JIT Time: %f %s (%.2f percent)\n", JITSeconds * Scale, ScaleStr,
+      mvprintw(LINES - 14 - HistogramHeight, 0, "       JIT Time: %f %s (%.2f percent)\n", JITSeconds * Scale, ScaleStr,
                JITSeconds / (double)MaxActiveThreads * 100.0);
-      mvprintw(LINES - 6 - HistogramHeight, 0, "    Signal Time: %f %s (%.2f percent)\n", SignalTime * Scale, ScaleStr,
+      mvprintw(LINES - 13 - HistogramHeight, 0, "    Signal Time: %f %s (%.2f percent)\n", SignalTime * Scale, ScaleStr,
                SignalTime / (double)MaxActiveThreads * 100.0);
 
       double SIGBUS_l = SIGBUSCount;
       double SIGBUS_Per_Second = SIGBUS_l * (SamplePeriodNanoseconds / NanosecondsInSeconds);
-      mvprintw(LINES - 5 - HistogramHeight, 0, "     SIGBUS Cnt: %ld (%lf per second)\n", SIGBUSCount, SIGBUS_Per_Second);
-      mvprintw(LINES - 4 - HistogramHeight, 0, "        SMC Cnt: %ld\n", SMCCount);
-      mvprintw(LINES - 3 - HistogramHeight, 0, "  Softfloat Cnt: %ld\n", FloatFallbackCount);
+      mvprintw(LINES - 12 - HistogramHeight, 0, "     SIGBUS Cnt: %ld (%lf per second)\n", SIGBUSCount, SIGBUS_Per_Second);
+      mvprintw(LINES - 11 - HistogramHeight, 0, "        SMC Cnt: %ld\n", SMCCount);
+      mvprintw(LINES - 10 - HistogramHeight, 0, "  Softfloat Cnt: %ld\n", FloatFallbackCount);
     }
 
     g_stats.fex_load_histogram.erase(g_stats.fex_load_histogram.begin());
@@ -513,23 +557,50 @@ int main(int argc, char** argv) {
       mvprintw(LINES - i - 1, COLS - 1, "]");
     }
 
-    mvprintw(LINES - 2 - HistogramHeight, 0, "FEX JIT Load: %f (cycles: %ld)\n", fex_load, total_jit_time);
+    mvprintw(LINES - 9 - HistogramHeight, 0, "FEX JIT Load: %f (cycles: %ld)\n", fex_load, total_jit_time);
 
-    const uint64_t MemBytes = g_stats.ResidentFEXAnon.load();
-    const uint64_t MemBytesJIT = g_stats.ResidentFEXJITAnon.load();
+    const uint64_t MemBytes = g_stats.MemStats.TotalAnon.load();
+    const uint64_t MemBytesJIT = g_stats.MemStats.JITCode.load();
+    const uint64_t MemBytesOpDispatcher = g_stats.MemStats.OpDispatcher.load();
+    const uint64_t MemBytesFrontend = g_stats.MemStats.Frontend.load();
+    const uint64_t MemBytesCPUBackend = g_stats.MemStats.CPUBackend.load();
+    const uint64_t MemBytesLookup = g_stats.MemStats.Lookup.load();
+    const uint64_t MemBytesLookupL1 = g_stats.MemStats.LookupL1.load();
+    const uint64_t MemBytesThreadStates = g_stats.MemStats.ThreadStates.load();
+    const uint64_t MemBytesUnaccounted = g_stats.MemStats.Unaccounted.load();
 
     if (MemBytes == ~0ULL) {
-      mvprintw(LINES - 1 - HistogramHeight, 0, "Total FEX Anon memory resident: Couldn't detect\n");
-      mvprintw(LINES - 0 - HistogramHeight, 0, "Total FEX JIT Anon memory resident: Couldn't detect\n");
+      mvprintw(LINES - 8 - HistogramHeight, 0, "Total FEX Anon memory resident: Couldn't detect\n");
 
     } else {
       const char *Granule {};
       const char *GranuleJIT {};
+      const char *GranuleOpDispatcher {};
+      const char *GranuleFrontend {};
+      const char *GranuleCPUBackend {};
+      const char *GranuleLookup {};
+      const char *GranuleLookupL1 {};
+      const char *GranuleThreadStates {};
+      const char *GranuleUnaccounted {};
       std::string SizeHuman = ConvertMemToHuman(MemBytes, &Granule);
       std::string SizeHumanJIT = ConvertMemToHuman(MemBytesJIT, &GranuleJIT);
+      std::string SizeHumanOpDispatcher = ConvertMemToHuman(MemBytesOpDispatcher, &GranuleOpDispatcher);
+      std::string SizeHumanFrontend = ConvertMemToHuman(MemBytesFrontend, &GranuleFrontend);
+      std::string SizeHumanCPUBackend = ConvertMemToHuman(MemBytesCPUBackend, &GranuleCPUBackend);
+      std::string SizeHumanLookup = ConvertMemToHuman(MemBytesLookup, &GranuleLookup);
+      std::string SizeHumanLookupL1 = ConvertMemToHuman(MemBytesLookupL1, &GranuleLookupL1);
+      std::string SizeHumanThreadStates = ConvertMemToHuman(MemBytesThreadStates, &GranuleThreadStates);
+      std::string SizeHumanUnaccounted = ConvertMemToHuman(MemBytesUnaccounted, &GranuleUnaccounted);
 
-      mvprintw(LINES - 1 - HistogramHeight, 0, "Total FEX Anon memory resident: %s %s\n", SizeHuman.c_str(), Granule);
-      mvprintw(LINES - 0 - HistogramHeight, 0, "Total FEX JIT Anon memory resident: %s %s\n", SizeHumanJIT.c_str(), GranuleJIT);
+      mvprintw(LINES - 8 - HistogramHeight, 0, "Total FEX Anon memory resident: %s %s\n", SizeHuman.c_str(), Granule);
+      mvprintw(LINES - 7 - HistogramHeight, 0, "    JIT resident:             %s %s\n", SizeHumanJIT.c_str(), GranuleJIT);
+      mvprintw(LINES - 6 - HistogramHeight, 0, "    OpDispatcher resident:    %s %s\n", SizeHumanOpDispatcher.c_str(), GranuleOpDispatcher);
+      mvprintw(LINES - 5 - HistogramHeight, 0, "    Frontend resident:        %s %s\n", SizeHumanFrontend.c_str(), GranuleFrontend);
+      mvprintw(LINES - 4 - HistogramHeight, 0, "    CPUBackend resident:      %s %s\n", SizeHumanCPUBackend.c_str(), GranuleCPUBackend);
+      mvprintw(LINES - 3 - HistogramHeight, 0, "    Lookup cache resident:    %s %s\n", SizeHumanLookup.c_str(), GranuleLookup);
+      mvprintw(LINES - 2 - HistogramHeight, 0, "    Lookup L1 cache resident: %s %s\n", SizeHumanLookupL1.c_str(), GranuleLookupL1);
+      mvprintw(LINES - 1 - HistogramHeight, 0, "    ThreadStates resident:    %s %s\n", SizeHumanThreadStates.c_str(), GranuleThreadStates);
+      mvprintw(LINES - 0 - HistogramHeight, 0, "    Unaccounted resident:     %s %s\n", SizeHumanUnaccounted.c_str(), GranuleUnaccounted);
     }
 
     size_t j = 0;
