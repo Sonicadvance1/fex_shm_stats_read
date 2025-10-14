@@ -209,6 +209,9 @@ static void check_shm_update_necessary() {
     munmap(g_stats.shm_base, g_stats.shm_size);
     g_stats.shm_size = new_shm_size;
     g_stats.shm_base = mmap(nullptr, new_shm_size, PROT_READ, MAP_SHARED, g_stats.shm_fd, 0);
+
+    // Update head pointer as well.
+    g_stats.head = reinterpret_cast<FEXCore::Profiler::ThreadStatsHeader*>(g_stats.shm_base);
   }
 }
 
