@@ -98,7 +98,6 @@ struct fex_stats {
 
   void* shm_base {};
   FEXCore::Profiler::ThreadStatsHeader* head {};
-  FEXCore::Profiler::ThreadStats* stats {};
 
   struct retained_stats {
     std::chrono::time_point<std::chrono::steady_clock> LastSeen;
