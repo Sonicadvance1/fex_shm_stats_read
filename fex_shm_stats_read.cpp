@@ -38,7 +38,7 @@ enum class AppType : uint8_t {
 struct ThreadStatsHeader {
   uint8_t Version;
   AppType app_type;
-  uint8_t _pad[2];
+  uint16_t ThreadStatsSize;
   char fex_version[48];
   std::atomic<uint32_t> Head;
   std::atomic<uint32_t> Size;
@@ -58,6 +58,7 @@ struct ThreadStats {
   uint64_t SMCCount;
   uint64_t FloatFallbackCount;
 };
+static_assert(sizeof(ThreadStats) % 16 == 0);
 } // namespace FEXCore::Profiler
 
 static const char* GetAppType(FEXCore::Profiler::AppType Type) {
@@ -98,6 +99,7 @@ struct fex_stats {
 
   void* shm_base {};
   FEXCore::Profiler::ThreadStatsHeader* head {};
+  size_t thread_stats_size_to_copy {};
 
   struct retained_stats {
     std::chrono::time_point<std::chrono::steady_clock> LastSeen;
@@ -427,6 +429,11 @@ int main(int argc, char** argv) {
     exit_screen("Unhandled FEX stats version\n");
   }
 
+  g_stats.thread_stats_size_to_copy = sizeof(FEXCore::Profiler::ThreadStats);
+  if (g_stats.head->ThreadStatsSize) {
+    g_stats.thread_stats_size_to_copy = std::min<size_t>(g_stats.head->ThreadStatsSize, g_stats.thread_stats_size_to_copy);
+  }
+
   g_stats.cycle_counter_frequency = get_cycle_counter_frequency();
   g_stats.hardware_concurrency = std::thread::hardware_concurrency();
   g_stats.max_thread_loads.reserve(g_stats.hardware_concurrency);
@@ -472,7 +479,7 @@ int main(int argc, char** argv) {
       FEXCore::Profiler::ThreadStats* Stat = StatFromOffset(g_stats.shm_base, HeaderOffset);
 
       auto it = &g_stats.sampled_stats[Stat->TID];
-      memcpy(&it->Stats, Stat, sizeof(FEXCore::Profiler::ThreadStats));
+      memcpy(&it->Stats, Stat, g_stats.thread_stats_size_to_copy);
       it->LastSeen = Now;
 
       HeaderOffset = Stat->Next;
@@ -499,7 +506,7 @@ int main(int argc, char** argv) {
       accumulate(TotalThisPeriod.SMCCount, SMCCount);
       accumulate(TotalThisPeriod.FloatFallbackCount, FloatFallbackCount);
 
-      memcpy(PreviousStats, Stat, sizeof(FEXCore::Profiler::ThreadStats));
+      memcpy(PreviousStats, Stat, g_stats.thread_stats_size_to_copy);
 
       if ((Now - it->second.LastSeen) >= std::chrono::seconds(10)) {
         it = g_stats.sampled_stats.erase(it);
