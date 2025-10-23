@@ -165,7 +165,7 @@ struct fex_stats {
     : fex_load_histogram(200, 0.0f) {}
 };
 
-const auto SamplePeriod = std::chrono::seconds(1);
+auto SamplePeriod = std::chrono::milliseconds(1000);
 fex_stats g_stats {};
 
 #ifndef __x86_64__
@@ -456,7 +456,9 @@ int main(int argc, char** argv) {
 
   g_stats.pidfd_watch = ::syscall(SYS_pidfd_open, g_stats.pid, 0);
   setlocale(LC_ALL, "");
-  initscr();
+  auto window = initscr();
+  nodelay(window, true);
+  keypad(window, true);
   start_color();
   init_pair(1, COLOR_RED, COLOR_BLACK);
   init_pair(2, COLOR_YELLOW, COLOR_BLACK);
@@ -761,6 +763,22 @@ int main(int argc, char** argv) {
 
     g_stats.previous_sample_period = Now;
 
+    int c = wgetch(window);
+    if (c == KEY_UP) {
+      if (SamplePeriod > std::chrono::milliseconds(100)) {
+        SamplePeriod = std::min(SamplePeriod + std::chrono::milliseconds(100), std::chrono::milliseconds(1000));
+      }
+      else {
+        SamplePeriod = std::max(SamplePeriod + std::chrono::milliseconds(10), std::chrono::milliseconds(10));
+      }
+    } else if (c == KEY_DOWN) {
+      if (SamplePeriod > std::chrono::milliseconds(100)) {
+        SamplePeriod = std::max(SamplePeriod - std::chrono::milliseconds(100), std::chrono::milliseconds(100));
+      }
+      else {
+        SamplePeriod = std::max(SamplePeriod - std::chrono::milliseconds(10), std::chrono::milliseconds(10));
+      }
+    }
     refresh();
     std::this_thread::sleep_for(SamplePeriod);
   }
