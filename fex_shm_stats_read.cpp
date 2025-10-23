@@ -25,6 +25,10 @@
 #include <signal.h>
 #include <vector>
 
+#if defined(__x86_64__) || defined(__i386__)
+#include <immintrin.h>
+#endif
+
 // Reimplementation of FEXCore::Profiler struct types.
 namespace FEXCore::Profiler {
 constexpr uint32_t STATS_VERSION = 2;
@@ -57,6 +61,12 @@ struct ThreadStats {
   uint64_t SIGBUSCount;
   uint64_t SMCCount;
   uint64_t FloatFallbackCount;
+
+  uint64_t AccumulatedCacheMissCount;
+  uint64_t AccumulatedCacheReadLockTime;
+  uint64_t AccumulatedCacheWriteLockTime;
+
+  uint64_t AccumulatedJITCount;
 };
 static_assert(sizeof(ThreadStats) % 16 == 0);
 } // namespace FEXCore::Profiler
@@ -94,6 +104,7 @@ struct fex_stats {
   bool first_sample = true;
   uint32_t shm_size {};
   uint64_t cycle_counter_frequency {};
+  double cycle_counter_frequency_double {};
   size_t hardware_concurrency {};
   size_t page_size {};
 
@@ -114,6 +125,7 @@ struct fex_stats {
 
   struct max_thread_loads {
     float load_percentage {};
+    uint64_t TotalCycles {};
     std::wstring pip_data {};
   };
   std::vector<max_thread_loads> max_thread_loads {};
@@ -376,6 +388,43 @@ exit:
   close(smap_fd);
 }
 
+static uint64_t CyclesToMilliseconds(uint64_t Cycles) {
+  const double Cycles_f = Cycles;
+  const double CyclesPerMillisecond = g_stats.cycle_counter_frequency_double / 1000.0;
+  return Cycles_f / CyclesPerMillisecond;
+}
+
+static void SampleStats(std::chrono::steady_clock::time_point Now) {
+  auto AtomicCopyStats = [](FEXCore::Profiler::ThreadStats* Dest, FEXCore::Profiler::ThreadStats* Src, size_t Size) {
+    // Take advantage of 16-byte alignment and single-copy atomicity of ARMv8.4.
+#if defined(__x86_64__) || defined(__i386__)
+    using copy_type = __m128;
+#else
+    using copy_type = __uint128_t;
+#endif
+    const auto elements_to_copy = g_stats.thread_stats_size_to_copy / sizeof(copy_type);
+    auto d_i = reinterpret_cast<copy_type*>(Dest);
+    auto s_i = reinterpret_cast<const copy_type*>(Src);
+    for (size_t i = 0; i < elements_to_copy; ++i) {
+      d_i[i] = s_i[i];
+    }
+  };
+
+  uint32_t HeaderOffset = g_stats.head->Head;
+  while (HeaderOffset != 0) {
+    if (HeaderOffset >= g_stats.shm_size) {
+      break;
+    }
+    FEXCore::Profiler::ThreadStats* Stat = StatFromOffset(g_stats.shm_base, HeaderOffset);
+
+    auto it = &g_stats.sampled_stats[Stat->TID];
+    AtomicCopyStats(&it->Stats, Stat, g_stats.thread_stats_size_to_copy);
+    it->LastSeen = Now;
+
+    HeaderOffset = Stat->Next;
+  }
+}
+
 int main(int argc, char** argv) {
   if (argc < 2) {
     printf("usage: %s [options] <pid>\n", argv[0]);
@@ -435,6 +484,8 @@ int main(int argc, char** argv) {
   }
 
   g_stats.cycle_counter_frequency = get_cycle_counter_frequency();
+  g_stats.cycle_counter_frequency_double = (double)g_stats.cycle_counter_frequency;
+
   g_stats.hardware_concurrency = std::thread::hardware_concurrency();
   g_stats.max_thread_loads.reserve(g_stats.hardware_concurrency);
 
@@ -469,22 +520,10 @@ int main(int argc, char** argv) {
 
     check_shm_update_necessary();
 
-    uint32_t HeaderOffset = g_stats.head->Head;
 
     auto Now = std::chrono::steady_clock::now();
-    while (HeaderOffset != 0) {
-      if (HeaderOffset >= g_stats.shm_size) {
-        break;
-      }
-      FEXCore::Profiler::ThreadStats* Stat = StatFromOffset(g_stats.shm_base, HeaderOffset);
 
-      auto it = &g_stats.sampled_stats[Stat->TID];
-      memcpy(&it->Stats, Stat, g_stats.thread_stats_size_to_copy);
-      it->LastSeen = Now;
-
-      HeaderOffset = Stat->Next;
-    }
-
+    SampleStats(Now);
     uint64_t total_jit_time {};
     size_t threads_sampled {};
     std::vector<uint64_t> hottest_threads;
@@ -505,6 +544,10 @@ int main(int argc, char** argv) {
       accumulate(TotalThisPeriod.SIGBUSCount, SIGBUSCount);
       accumulate(TotalThisPeriod.SMCCount, SMCCount);
       accumulate(TotalThisPeriod.FloatFallbackCount, FloatFallbackCount);
+      accumulate(TotalThisPeriod.AccumulatedCacheMissCount, AccumulatedCacheMissCount);
+      accumulate(TotalThisPeriod.AccumulatedCacheReadLockTime, AccumulatedCacheReadLockTime);
+      accumulate(TotalThisPeriod.AccumulatedCacheWriteLockTime, AccumulatedCacheWriteLockTime);
+      accumulate(TotalThisPeriod.AccumulatedJITCount, AccumulatedJITCount);
 
       memcpy(PreviousStats, Stat, g_stats.thread_stats_size_to_copy);
 
@@ -526,7 +569,7 @@ int main(int argc, char** argv) {
 
     const double NanosecondsInSeconds = 1'000'000'000.0;
     const double SamplePeriodNanoseconds = std::chrono::duration_cast<std::chrono::nanoseconds>(sample_period).count();
-    const double MaximumCyclesInSecond = (double)g_stats.cycle_counter_frequency;
+    const double MaximumCyclesInSecond = g_stats.cycle_counter_frequency_double;
     const double MaximumCyclesInSamplePeriod = MaximumCyclesInSecond * (SamplePeriodNanoseconds / NanosecondsInSeconds);
     const double MaximumCoresThreadsPossible = std::min(g_stats.hardware_concurrency, threads_sampled);
 
@@ -536,21 +579,26 @@ int main(int argc, char** argv) {
     g_stats.max_thread_loads.resize(minimum_hot_threads);
     for (size_t i = 0; i < minimum_hot_threads; ++i) {
       g_stats.max_thread_loads[i].load_percentage = ((double)hottest_threads[i] / MaximumCyclesInSamplePeriod) * 100.0;
+      g_stats.max_thread_loads[i].TotalCycles = hottest_threads[i];
     }
 
     const size_t HistogramHeight = 11;
     if (!FirstLoop) {
-      const auto JITSeconds = (double)(TotalThisPeriod.AccumulatedJITTime) / (double)g_stats.cycle_counter_frequency;
-      const auto SignalTime = (double)(TotalThisPeriod.AccumulatedSignalTime) / (double)g_stats.cycle_counter_frequency;
+      const auto JITSeconds = (double)(TotalThisPeriod.AccumulatedJITTime) / g_stats.cycle_counter_frequency_double;
+      const auto SignalTime = (double)(TotalThisPeriod.AccumulatedSignalTime) / g_stats.cycle_counter_frequency_double;
 
       const auto SIGBUSCount = TotalThisPeriod.SIGBUSCount;
       const auto SMCCount = TotalThisPeriod.SMCCount;
       const auto FloatFallbackCount = TotalThisPeriod.FloatFallbackCount;
+      const auto AccumulatedCacheMissCount = TotalThisPeriod.AccumulatedCacheMissCount;
+      const auto AccumulatedCacheReadLockTime = (double)(TotalThisPeriod.AccumulatedCacheReadLockTime) / g_stats.cycle_counter_frequency_double;
+      const auto AccumulatedCacheWriteLockTime = (double)(TotalThisPeriod.AccumulatedCacheWriteLockTime) / g_stats.cycle_counter_frequency_double;
+      const auto AccumulatedJITCount = TotalThisPeriod.AccumulatedJITCount;
 
       const auto MaxActiveThreads = std::min<size_t>(g_stats.sampled_stats.size(), g_stats.hardware_concurrency);
 
-      constexpr auto TopOfThreads = 20;
-      mvprintw(LINES - TopOfThreads - minimum_hot_threads - HistogramHeight, 0, "%ld threads executing\n", minimum_hot_threads);
+      constexpr auto TopOfThreads = 24;
+      mvprintw(LINES - TopOfThreads - minimum_hot_threads - HistogramHeight, 0, "Top %ld threads executing\n", minimum_hot_threads);
 
       size_t max_pips = std::min(COLS, 50) - 2;
       double percentage_per_pip = 100.0 / (double)max_pips;
@@ -569,7 +617,7 @@ int main(int argc, char** argv) {
         wmemset(thread_loads.pip_data.data() + full_pips, partial_pips[digit_percent], 1);
 
         const auto y_offset = LINES - TopOfThreads - i - HistogramHeight;
-        mvprintw(y_offset, 0, "[%ls]: %.02f%%\n", g_stats.empty_pip_data.data(), thread_load);
+        mvprintw(y_offset, 0, "[%ls]: %.02f%% (%zd ms/S, %zd cycles)\n", g_stats.empty_pip_data.data(), thread_load, CyclesToMilliseconds(thread_loads.TotalCycles), thread_loads.TotalCycles);
         int attr = 0;
         if (thread_load >= 75.0) {
           attr = 1;
@@ -585,18 +633,30 @@ int main(int argc, char** argv) {
         }
       }
 
-      mvprintw(LINES - 19 - HistogramHeight, 0, "Total (%zd millisecond sample period):\n",
+      mvprintw(LINES - 23 - HistogramHeight, 0, "Total (%zd millisecond sample period):\n",
                std::chrono::duration_cast<std::chrono::milliseconds>(SamplePeriod).count());
-      mvprintw(LINES - 18 - HistogramHeight, 0, "       JIT Time: %f %s (%.2f percent)\n", JITSeconds * Scale, ScaleStr,
+      mvprintw(LINES - 22 - HistogramHeight, 0, "       JIT Time: %f %s (%.2f percent)\n", JITSeconds * Scale, ScaleStr,
                JITSeconds / (double)MaxActiveThreads * 100.0);
-      mvprintw(LINES - 17 - HistogramHeight, 0, "    Signal Time: %f %s (%.2f percent)\n", SignalTime * Scale, ScaleStr,
+      mvprintw(LINES - 21 - HistogramHeight, 0, "    Signal Time: %f %s (%.2f percent)\n", SignalTime * Scale, ScaleStr,
                SignalTime / (double)MaxActiveThreads * 100.0);
 
-      double SIGBUS_l = SIGBUSCount;
-      double SIGBUS_Per_Second = SIGBUS_l * (SamplePeriodNanoseconds / NanosecondsInSeconds);
-      mvprintw(LINES - 16 - HistogramHeight, 0, "     SIGBUS Cnt: %ld (%lf per second)\n", SIGBUSCount, SIGBUS_Per_Second);
-      mvprintw(LINES - 15 - HistogramHeight, 0, "        SMC Cnt: %ld\n", SMCCount);
-      mvprintw(LINES - 14 - HistogramHeight, 0, "  Softfloat Cnt: %ld\n", FloatFallbackCount);
+      const double SIGBUS_l = SIGBUSCount;
+      const double SIGBUS_Per_Second = SIGBUS_l * (SamplePeriodNanoseconds / NanosecondsInSeconds);
+
+      const double AccumulatedCacheMissCount_l = AccumulatedCacheMissCount;
+      const double AccumulatedCacheMissCount_Per_Second = AccumulatedCacheMissCount_l * (SamplePeriodNanoseconds / NanosecondsInSeconds);
+
+      const double AccumulatedJITCount_l = AccumulatedJITCount;
+      const double AccumulatedJITCount_Per_Second = AccumulatedJITCount_l * (SamplePeriodNanoseconds / NanosecondsInSeconds);
+      mvprintw(LINES - 20 - HistogramHeight, 0, "     SIGBUS Cnt: %ld (%lf per second)\n", SIGBUSCount, SIGBUS_Per_Second);
+      mvprintw(LINES - 19 - HistogramHeight, 0, "        SMC Cnt: %ld\n", SMCCount);
+      mvprintw(LINES - 18 - HistogramHeight, 0, "  Softfloat Cnt: %ld\n", FloatFallbackCount);
+      mvprintw(LINES - 17 - HistogramHeight, 0, "  CacheMiss Cnt: %ld (%lf per second)\n", AccumulatedCacheMissCount, AccumulatedCacheMissCount_Per_Second);
+      mvprintw(LINES - 16 - HistogramHeight, 0, "    $RDLck Time: %f %s (%.2f percent)\n", AccumulatedCacheReadLockTime * Scale, ScaleStr,
+               AccumulatedCacheReadLockTime / (double)MaxActiveThreads * 100.0);
+      mvprintw(LINES - 15 - HistogramHeight, 0, "    $WRLck Time: %f %s (%.2f percent)\n", AccumulatedCacheWriteLockTime * Scale, ScaleStr,
+               AccumulatedCacheWriteLockTime / (double)MaxActiveThreads * 100.0);
+      mvprintw(LINES - 14 - HistogramHeight, 0, "        JIT Cnt: %ld (%lf percent)\n", AccumulatedJITCount, AccumulatedJITCount_Per_Second);
     }
 
     g_stats.fex_load_histogram.erase(g_stats.fex_load_histogram.begin());
