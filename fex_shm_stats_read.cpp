@@ -330,8 +330,9 @@ static void ResidentFEXAnonSampling() {
         continue;
       }
 
-      if (Line.find("JEMalloc") != Line.npos) {
+      if (Line.find("JEMalloc") != Line.npos || Line.find("FEXAllocator") != Line.npos) {
         ActiveSubRegion = &TotalJEMallocResident;
+        sscanf(Line.c_str(), "%lx-%lx", &Begin, &End);
         continue;
       }
 
@@ -352,7 +353,7 @@ static void ResidentFEXAnonSampling() {
         TotalResident += ResidentInBytes;
         *ActiveSubRegion += ResidentInBytes;
 
-        if (ActiveSubRegion == &TotalUnaccounted) {
+        if (ActiveSubRegion == &TotalJEMallocResident) {
           if (LargestRSSAnon.Size < ResidentInBytes) {
             LargestRSSAnon = {
               .Begin = Begin,
