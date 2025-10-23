@@ -611,7 +611,7 @@ int main(int argc, char** argv) {
       for (size_t i = 0; i < g_stats.max_thread_loads.size(); ++i) {
         auto& thread_loads = g_stats.max_thread_loads[i];
         double thread_load = std::min(thread_loads.load_percentage, 100.0f);
-        thread_loads.pip_data.resize(max_pips + 1);
+        thread_loads.pip_data.resize(max_pips);
         double rounded_down = std::floor(thread_load / 10.0) * 10.0;
         size_t full_pips = rounded_down / percentage_per_pip;
         size_t digit_percent = thread_load - rounded_down;
@@ -630,7 +630,7 @@ int main(int argc, char** argv) {
         if (attr) {
           attron(COLOR_PAIR(attr));
         }
-        mvprintw(y_offset, 1, "%ls", thread_loads.pip_data.data());
+        mvprintw(y_offset, 0, "[%ls]", thread_loads.pip_data.data());
         if (attr) {
           attroff(COLOR_PAIR(attr));
         }
