@@ -524,7 +524,9 @@ int main(int argc, char** argv) {
 
     auto Now = std::chrono::steady_clock::now();
 
+    // Sample the stats from the process. Try and be as quick as possible.
     SampleStats(Now);
+
     uint64_t total_jit_time {};
     size_t threads_sampled {};
     std::vector<uint64_t> hottest_threads;
