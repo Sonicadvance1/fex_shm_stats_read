@@ -603,7 +603,7 @@ int main(int argc, char** argv) {
       const auto MaxActiveThreads = std::min<size_t>(g_stats.sampled_stats.size(), g_stats.hardware_concurrency);
 
       constexpr auto TopOfThreads = 24;
-      mvprintw(LINES - TopOfThreads - minimum_hot_threads - HistogramHeight, 0, "Top %ld threads executing\n", minimum_hot_threads);
+      mvprintw(LINES - TopOfThreads - minimum_hot_threads - HistogramHeight, 0, "Top %ld threads executing (%ld total)\n", minimum_hot_threads, threads_sampled);
 
       size_t max_pips = std::min(COLS, 50) - 2;
       double percentage_per_pip = 100.0 / (double)max_pips;
